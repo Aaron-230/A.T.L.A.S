@@ -1,122 +1,170 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
-#include <Adafruit_Sensor.h>
-#include <Adafruit_BME280.h>
 #include <DHT.h>
 #include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BMP280.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// --- Configuration ---
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define DHTPIN D3
+// --- Revised Pin Definitions ---
+#define DHTPIN 2          // GPIO 2  (D4) - DHT Data
+#define OLED_SDA 4        // GPIO 4  (D2) - OLED SDA
+#define OLED_SCL 5        // GPIO 5  (D1) - OLED SCL
+#define BMP_SDA 14        // GPIO 14 (D5) - BMP SDA
+#define BMP_SCL 12        // GPIO 12 (D6) - BMP SCL
+#define MQ135_PIN A0
 #define DHTTYPE DHT11
 
-const char* ssid = "A.T.L.A.S.";
-const char* password = "Password";
-
-// Objects
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-Adafruit_BME280 bme;
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
 DHT dht(DHTPIN, DHTTYPE);
+Adafruit_BMP280 bmp; 
 ESP8266WebServer server(80);
 
-// Global Variables
-float t, h, p, airQuality;
-int batteryPct;
+float t = 0, h = 0, p = 0;
+int airQuality = 0;
+unsigned long lastEyeAnimate = 0;
+unsigned long lastGazeShift = 0;
+unsigned long lastBlinkTrigger = 0;
+int curEyeX = 0, curEyeY = 0, targetEyeX = 0, targetEyeY = 0;
+int emotion = 0; 
+bool isBlinking = false;
 
-// --- HTML UI (Stark Style) ---
+// --- Animation Engine ---
+void drawEyes(int offsetX, int offsetY, bool blink, int state) {
+  display.clearDisplay();
+  int eyeW = 22; int eyeH = 28; int eyeR = 7;
+  int eyeY = 18 + offsetY; 
+  int leftX = 32 + offsetX; int rightX = 72 + offsetX;
+  
+  if (blink) {
+    display.fillRoundRect(leftX, eyeY + 12, eyeW, 5, 2, WHITE);
+    display.fillRoundRect(rightX, eyeY + 12, eyeW, 5, 2, WHITE);
+  } else if (state == 1) { // HOT
+    display.fillRoundRect(leftX, eyeY + 8, eyeW, 20, 5, WHITE);
+    display.fillRoundRect(rightX, eyeY + 8, eyeW, 20, 5, WHITE);
+    display.fillRect(leftX, eyeY - 5, eyeW, 13, BLACK);
+    display.fillRect(rightX, eyeY - 5, eyeW, 13, BLACK);
+  } else if (state == 2) { // ALERT
+    display.fillRoundRect(leftX - 2, eyeY - 4, eyeW + 4, eyeH + 8, 11, WHITE);
+    display.fillRoundRect(rightX - 2, eyeY - 4, eyeW + 4, eyeH + 8, 11, WHITE);
+  } else if (state == 3) { // COLD
+    int shiver = (millis() % 100 < 50) ? 1 : -1;
+    display.fillRoundRect(leftX + shiver, eyeY + 10, eyeW, 10, 3, WHITE);
+    display.fillRoundRect(rightX + shiver, eyeY + 10, eyeW, 10, 3, WHITE);
+  } else { // NEUTRAL
+    display.fillRoundRect(leftX, eyeY, eyeW, eyeH, eyeR, WHITE);
+    display.fillRoundRect(rightX, eyeY, eyeW, eyeH, eyeR, WHITE);
+  }
+  display.display();
+}
+
+int moveTowards(int current, int target, int step) {
+  if (current < target) return current + step;
+  if (current > target) return current - step;
+  return current;
+}
+
+// --- Web UI with Degree C ---
 const char INDEX_HTML[] PROGMEM = R"rawtext(
 <!DOCTYPE html>
 <html>
 <head>
-    <title>A.T.L.A.S.</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body { font-family: 'Segoe UI', sans-serif; background: #121212; color: white; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-        .card { background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(10px); border-radius: 20px; padding: 30px; border: 1px solid rgba(255, 255, 255, 0.1); width: 90%; max-width: 400px; text-align: center; }
-        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 20px; }
-        .stat-box { background: rgba(255, 255, 255, 0.03); padding: 20px; border-radius: 15px; }
-        .temp { color: #ff7675; font-size: 2em; font-weight: bold; }
-        .hum { color: #74b9ff; font-size: 2em; font-weight: bold; }
-        .label { font-size: 0.8em; color: #888; margin-top: 5px; }
-        .status-bar { margin-top: 20px; font-size: 0.9em; color: #55efc4; }
-        .battery { font-size: 0.8em; color: #fab1a0; margin-top: 10px; }
-    </style>
-    <script>
-        setInterval(() => { fetch('/data').then(r => r.json()).then(d => {
-            document.getElementById('t').innerText = d.temp;
-            document.getElementById('h').innerText = d.hum;
-            document.getElementById('b').innerText = d.batt + '%';
-            document.getElementById('a').innerText = d.air;
-        });}, 2000);
-    </script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: 'Segoe UI', sans-serif; background-color: #0f0f0f; color: white; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+    .container { background: #1a1a1a; padding: 30px; border-radius: 30px; width: 300px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+    .card { background: #222; margin: 10px 0; padding: 20px; border-radius: 20px; }
+    .val { font-size: 32px; font-weight: bold; display: block; }
+    .label { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 1px; }
+  </style>
 </head>
 <body>
-    <div class="card">
-        <h2>A.T.L.A.S. Dashboard</h2>
-        <div class="grid">
-            <div class="stat-box"><div class="temp"><span id="t">--</span>°</div><div class="label">Temp</div></div>
-            <div class="stat-box"><div class="hum"><span id="h">--</span>%</div><div class="label">Humidity</div></div>
-        </div>
-        <div class="status-bar">System Active: <span id="a">--</span> AQI</div>
-        <div class="battery">Battery: <span id="b">--</span></div>
-    </div>
+  <div class="container">
+    <h2>A.T.L.A.S.</h2>
+    <div class="card"><span class="val" id="t" style="color:#ff7675">--</span><span class="label">Temperature</span></div>
+    <div class="card"><span class="val" id="h" style="color:#74b9ff">--</span><span class="label">Humidity</span></div>
+    <div class="card"><span class="val" id="p" style="color:#a29bfe">--</span><span class="label">Pressure</span></div>
+    <div class="card"><span class="val" id="a" style="color:#ffeaa7">--</span><span class="label">Air Quality</span></div>
+  </div>
+  <script>
+    setInterval(() => {
+      fetch('/data').then(r => r.json()).then(d => {
+        document.getElementById('t').innerHTML = d.t + "&deg;C";
+        document.getElementById('h').innerText = d.h + "%";
+        document.getElementById('p').innerText = d.p + " hPa";
+        document.getElementById('a').innerText = d.a + " PPM";
+      });
+    }, 2000);
+  </script>
 </body>
 </html>
 )rawtext";
 
 void handleRoot() { server.send(200, "text/html", INDEX_HTML); }
-
 void handleData() {
-  String json = "{\"temp\":\"" + String(t, 1) + "\",\"hum\":\"" + String(h, 0) + 
-                "\",\"air\":\"" + String(airQuality, 0) + "\",\"batt\":\"" + String(batteryPct) + "\"}";
+  String json = "{\"t\":\"" + String(t, 1) + "\",\"h\":\"" + String(h, 0) + 
+                "\",\"p\":\"" + String(p, 1) + "\",\"a\":\"" + String(airQuality) + "\"}";
   server.send(200, "application/json", json);
 }
 
 void setup() {
   Serial.begin(115200);
-  
-  // Sensors Init
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) Serial.println("OLED Fail");
-  if(!bme.begin(0x76)) Serial.println("BME280 Fail");
   dht.begin();
 
-  // AP Mode
-  WiFi.softAP(ssid, password);
+  // Initialize OLED (I2C Bus 1)
+  Wire.begin(OLED_SDA, OLED_SCL);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+
+  // Initialize BMP280 (I2C Bus 2)
+  Wire.begin(BMP_SDA, BMP_SCL);
+  if (!bmp.begin(0x76)) { bmp.begin(0x77); }
+
+  WiFi.softAP("A.T.L.A.S.", "Password");
   server.on("/", handleRoot);
   server.on("/data", handleData);
   server.begin();
-
-  display.clearDisplay();
-  display.setTextColor(WHITE);
-  display.setCursor(0,0);
-  display.print("AP: Stark_Home");
-  display.display();
 }
 
 void loop() {
   server.handleClient();
+  unsigned long currentMillis = millis();
 
-  // Read Sensors
-  t = bme.readTemperature();
-  h = bme.readHumidity();
-  airQuality = analogRead(A0); // MQ135 and Battery usually share A0 via a Mux or Switch
+  // Read DHT & MQ135
+  float newT = dht.readTemperature();
+  float newH = dht.readHumidity();
+  if (!isnan(newT)) t = newT;
+  if (!isnan(newH)) h = newH;
+  airQuality = analogRead(MQ135_PIN);
+
+  // BMP280 Bus Switch
+  Wire.begin(BMP_SDA, BMP_SCL);
+  p = bmp.readPressure() / 100.0F;
   
-  // Battery Calculation (Assumes voltage divider on A0)
-  // Max LiPo 4.2V -> Map to 100%
-  int rawV = analogRead(A0); 
-  batteryPct = map(rawV, 600, 1024, 0, 100); 
-  batteryPct = constrain(batteryPct, 0, 100);
+  // Emotion Updates
+  if (airQuality > 550) emotion = 2;
+  else if (t > 32) emotion = 1;
+  else if (t < 18) emotion = 3;
+  else emotion = 0;
 
-  // Update OLED
-  display.clearDisplay();
-  display.setCursor(0,10);
-  display.printf("Temp: %.1f C", t);
-  display.setCursor(0,30);
-  display.printf("Hum: %.0f%%", h);
-  display.display();
+  // OLED Animation Bus Switch
+  if (currentMillis - lastEyeAnimate >= 35) {
+    lastEyeAnimate = currentMillis;
+    if (currentMillis - lastGazeShift >= random(3000, 7000)) {
+      lastGazeShift = currentMillis;
+      targetEyeX = random(-6, 7);
+      targetEyeY = random(-4, 5);
+    }
+    if (currentMillis - lastBlinkTrigger >= random(4000, 10000)) {
+      lastBlinkTrigger = currentMillis;
+      isBlinking = true;
+    }
+    if (isBlinking && (currentMillis - lastBlinkTrigger > 120)) isBlinking = false;
 
-  delay(100); 
+    curEyeX = moveTowards(curEyeX, targetEyeX, 1);
+    curEyeY = moveTowards(curEyeY, targetEyeY, 1);
+
+    Wire.begin(OLED_SDA, OLED_SCL);
+    drawEyes(curEyeX, curEyeY, isBlinking, emotion);
+  }
 }
